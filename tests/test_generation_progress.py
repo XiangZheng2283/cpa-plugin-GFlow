@@ -59,9 +59,9 @@ class ProgressTest(unittest.IsolatedAsyncioTestCase):
             event = decode(events[0])
             expected = {"stage": "submitting_image", "percent": 48, "basis": "stage"}
             self.assertEqual(event["gflow_progress"], expected)
-            self.assertEqual(event["choices"][0]["delta"], {"gflow_progress": expected})
+            self.assertEqual(event["choices"][0]["delta"], {"content": "", "gflow_progress": expected})
             self.assertNotIn("synthetic-secret", events[0])
-            self.assertNotIn("content", event["choices"][0]["delta"])
+            self.assertEqual(event["choices"][0]["delta"]["content"], "")
             self.assertIsNone(event["choices"][0]["finish_reason"])
         self.assertIsNone(CURRENT_PROGRESS.get())
 

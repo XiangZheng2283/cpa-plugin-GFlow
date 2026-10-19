@@ -58,7 +58,7 @@ def progress_chunk(value):
         "object": "chat.completion.chunk",
         "created": int(time.time()), "model": "flow2api",
         "gflow_progress": value,
-        "choices": [{"index": 0, "delta": {"gflow_progress": value},
+        "choices": [{"index": 0, "delta": {"content": "", "gflow_progress": value},
                      "finish_reason": None}],
     }
     return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"

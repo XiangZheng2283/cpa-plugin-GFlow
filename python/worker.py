@@ -461,6 +461,8 @@ class GFlowService:
             )
 
             if is_stream:
+                from media_response import inline_cached_images, stream_cached_media
+                chunk_media = stream_cached_media if params.get("gflow_media_protocol") == "v1" else None
                 async for chunk in _iterate_openai_stream(normalized, base_url_override):
                     from generation_errors import generation_error
                     error = generation_error(chunk)
@@ -469,13 +471,13 @@ class GFlowService:
                         # An error inside a normal SSE chunk is counted as success by the host.
                         self.send_line({"id": req_id, "done": True, "error": error})
                         return
-                    from media_response import inline_cached_images
-                    chunk = inline_cached_images(chunk, self.tmp_dir)
-                    self.send_line({
-                        "id": req_id,
-                        "stream": True,
-                        "chunk": chunk,
-                    })
+                    output_chunks = chunk_media(chunk, self.tmp_dir) if chunk_media else [inline_cached_images(chunk, self.tmp_dir)]
+                    for output_chunk in output_chunks:
+                        self.send_line({
+                            "id": req_id,
+                            "stream": True,
+                            "chunk": output_chunk,
+                        })
                 self.send_line({
                     "id": req_id,
                     "stream": True,
