@@ -96,7 +96,7 @@ async function saveConfiguration(input) {
     autoSync: Boolean(input.autoSync)
   };
   if (!await chrome.permissions.contains({ origins: [connectionPermission(config.apiUrl)] })) {
-    throw new Error('请授权扩展连接本机 GFlow');
+    throw new Error('请授权扩展连接 GFlow');
   }
   await chrome.storage.local.set({ config });
   await restoreAlarm();
