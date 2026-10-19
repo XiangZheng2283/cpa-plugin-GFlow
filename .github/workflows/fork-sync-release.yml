@@ -1,0 +1,218 @@
+name: Fork sync and compat release
+
+# 仅存在于 fork：同步上游 main，并把上游已打 tag 的版本在 Ubuntu 22.04 (GLIBC 2.35) 上重新构建发布。
+# 上游 build.yml 保持原样，避免同步冲突。
+
+on:
+  workflow_dispatch:
+    inputs:
+      sync:
+        description: 先同步上游 main
+        type: boolean
+        default: true
+      force:
+        description: 该版本已发布时仍删除并重新构建发布
+        type: boolean
+        default: false
+  schedule:
+    - cron: '23 */6 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-sync-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: daodeqing/cpa-plugin-GFlow
+  TAG_SUFFIX: -glibc2.35
+  MAX_GLIBC: '2.35'
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  sync:
+    name: Sync upstream
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.plan.outputs.sha }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - name: Sync fork main with upstream
+        if: github.event_name == 'schedule' || inputs.sync
+        env:
+          # 上游改动 .github/workflows 时 GITHUB_TOKEN 无权同步，需要带 Workflows 写权限的 SYNC_TOKEN。
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: |
+          if ! out=$(gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=main 2>&1); then
+            echo "$out"
+            echo "::error::同步上游失败。若上游修改了 workflow 文件，请配置仓库 secret SYNC_TOKEN（Contents + Workflows 读写）；若有冲突请手动合并。"
+            exit 1
+          fi
+          echo "$out"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve upstream release
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          version=$(python3 -c 'import tomllib;print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          upstream_tag="v$version"
+          tag="$upstream_tag$TAG_SUFFIX"
+          refs=$(git ls-remote "https://github.com/$UPSTREAM_REPOSITORY.git" "refs/tags/$upstream_tag" "refs/tags/$upstream_tag^{}")
+          sha=$(echo "$refs" | awk '/\^\{\}$/{print $1}')
+          [ -n "$sha" ] || sha=$(echo "$refs" | awk 'NF{print $1; exit}')
+          if [ -z "$sha" ]; then
+            if [ "$FORCE" != "true" ]; then
+              echo "::notice::上游尚未发布 $upstream_tag，跳过。"
+              echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            sha=$(git rev-parse HEAD)
+            echo "::warning::上游没有 $upstream_tag，force 模式下使用 main $sha 构建。"
+          fi
+          if ! git merge-base --is-ancestor "$sha" HEAD; then
+            echo "::error::上游 $upstream_tag ($sha) 不在 fork main 历史中，请先同步。"; exit 1
+          fi
+          publish=true
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null | grep -qx false; then
+            if [ "$FORCE" = "true" ]; then
+              echo "::notice::$tag 已发布，force 模式将重新发布。"
+            else
+              echo "::notice::$tag 已发布，无需构建。"
+              publish=false
+            fi
+          fi
+          {
+            echo "version=$version"; echo "tag=$tag"; echo "sha=$sha"; echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "### $tag ← $UPSTREAM_REPOSITORY@$upstream_tag (\`$sha\`) publish=$publish" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: sync
+    if: needs.sync.outputs.publish == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { goos: linux, goarch: arm64, runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { goos: darwin, goarch: amd64, runner: macos-15-intel, target: x86_64-apple-darwin }
+          - { goos: darwin, goarch: arm64, runner: macos-14, target: aarch64-apple-darwin }
+          - { goos: windows, goarch: amd64, runner: windows-2022, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install build and test dependencies
+        run: python -B -m pip install -r python/flow2api/requirements.txt "pyinstaller==6.16.0" "pillow>=10,<13" "send2trash>=1.8,<3"
+      - name: Test, freeze Python, embed worker and verify clean plugin installation
+        run: python -B .github/scripts/build.py --goos ${{ matrix.goos }} --goarch ${{ matrix.goarch }} --target ${{ matrix.target }}
+      # 冒烟测试已在本 runner (GLIBC 2.35) 上实际拉起 worker；这里再限制插件本体的符号版本。
+      - name: Verify glibc requirement
+        if: matrix.goos == 'linux'
+        run: |
+          required=$(objdump -T dist/gflow.so | grep -o 'GLIBC_[0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -1)
+          echo "gflow.so requires GLIBC $required (max $MAX_GLIBC)"
+          [ "$(printf '%s\n%s\n' "$required" "$MAX_GLIBC" | sort -V | tail -1)" = "$MAX_GLIBC" ]
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/verification-*.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ matrix.goos }}-${{ matrix.goarch }}
+          include-hidden-files: true
+          path: |
+            .build/**/worker.log
+            .build/freezer/**/*.txt
+          if-no-files-found: ignore
+
+  release:
+    name: Release
+    needs: [sync, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-download
+          pattern: dist-*
+          merge-multiple: true
+      - name: Verify artifacts and write release notes
+        env:
+          VERSION: ${{ needs.sync.outputs.version }}
+          SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          python3 - <<'EOF'
+          import hashlib, json, os, re, zipfile
+          from pathlib import Path
+          version, sha = os.environ["VERSION"], os.environ["SHA"]
+          dist = Path("dist-download")
+          platforms = [("darwin", "amd64", "dylib"), ("darwin", "arm64", "dylib"),
+                       ("linux", "amd64", "so"), ("linux", "arm64", "so"), ("windows", "amd64", "dll")]
+          sums = []
+          for goos, goarch, ext in platforms:
+              name = f"gflow_{version}_{goos}_{goarch}.zip"
+              path = dist / name
+              expected = (dist / (name + ".sha256")).read_text(encoding="utf-8").strip()
+              assert expected == f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {name}", name
+              evidence = json.loads((dist / f"verification-{goos}-{goarch}.json").read_text(encoding="utf-8"))
+              assert evidence["version"] == version and evidence["clean_install_smoke"] == "passed", evidence
+              with zipfile.ZipFile(path) as archive:
+                  assert archive.namelist() == ["gflow." + ext] and archive.testzip() is None, name
+              sums.append(expected)
+          (dist / "checksums.txt").write_text("\n".join(sorted(sums)) + "\n", encoding="utf-8")
+          notes = Path("RELEASE_NOTES.md").read_text(encoding="utf-8")
+          match = re.search(rf"^# GFlow v{re.escape(version)}\s*$(.*?)(?=^# GFlow v|\Z)", notes, re.M | re.S)
+          upstream = match.group(1).strip() if match else ""
+          repo = os.environ["UPSTREAM_REPOSITORY"]
+          header = (f"基于上游 [{repo} v{version}](https://github.com/{repo}/releases/tag/v{version})（`{sha[:12]}`）重新构建。\n\n"
+                    f"- Linux 产物在 Ubuntu 22.04 构建，只需 GLIBC ≤ {os.environ['MAX_GLIBC']}（上游官方包需要 2.39，Ubuntu 22.04 / Debian 12 上 worker 无法启动）。\n"
+                    "- macOS / Windows 产物与上游构建方式相同。\n"
+                    "- 安装：解压对应平台 zip，用其中的 `gflow.so` 替换 CPA `plugins/<os>/<arch>/` 下的 `gflow-v*.so` 后重启 CPA。\n")
+          Path("release-notes.md").write_text(header + ("\n## 上游更新\n\n" + upstream + "\n" if upstream else ""), encoding="utf-8")
+          EOF
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          elif gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG"
+          fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" --latest \
+            --title "GFlow $TAG" --notes-file release-notes.md \
+            dist-download/*.zip dist-download/checksums.txt
+          echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
