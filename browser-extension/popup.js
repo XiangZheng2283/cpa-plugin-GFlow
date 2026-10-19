@@ -77,7 +77,7 @@ async function saveFromForm() {
   if (connectionToken) {
     connection = validateConnection({ product: 'GFlow', apiUrl, connectionToken });
     const granted = await chrome.permissions.request({ origins: [connectionPermission(connection.apiUrl)] });
-    if (!granted) throw new Error('需要授权扩展连接本机 GFlow');
+    if (!granted) throw new Error('需要授权扩展连接 GFlow');
   } else if (!paired || apiUrl !== savedApiUrl) {
     throw new Error('请从 GFlow 复制扩展配置并粘贴到快捷导入框');
   }
