@@ -55,10 +55,12 @@ vm.runInContext(COMMON, context);
 vm.runInContext(BACKGROUND, context);
 (async () => {
   const connection = {product:'GFlow', apiUrl:'http://127.0.0.1:8317/v0/management/plugins/gflow/api/extension-sync', connectionToken:'fake-management'};
-  for (const apiUrl of ['https://evil.test/v0/management/plugins/gflow/api/extension-sync','http://127.0.0.1:8317/v8/management/config','http://127.0.0.1:8317/v0/management/plugins/gflow/api/extension-sync?secret=x']) {
+  for (const apiUrl of ['http://cpa.example.test/v0/management/plugins/gflow/api/extension-sync','https://user:pw@cpa.example.test/v0/management/plugins/gflow/api/extension-sync','http://127.0.0.1:8317/v8/management/config','http://127.0.0.1:8317/v0/management/plugins/gflow/api/extension-sync?secret=x']) {
     assert.throws(() => context.validateConnection({...connection,apiUrl}));
   }
-  console.log('PASS remote destinations and unrelated management routes rejected');
+  const remote = context.validateConnection({...connection,apiUrl:'https://cpa.example.test/v0/management/plugins/gflow/api/extension-sync'});
+  assert.equal(context.connectionPermission(remote.apiUrl), 'https://cpa.example.test/*');
+  console.log('PASS plaintext remote destinations and unrelated management routes rejected; HTTPS remote host scoped');
   await context.saveConfiguration({connection,loginAccount:'Example@example.test',autoSync:true});
   const publicState = await context.publicState();
   assert.equal(publicState.configured,true);
