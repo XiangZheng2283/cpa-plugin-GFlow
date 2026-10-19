@@ -106,10 +106,9 @@ observability:
     environment.pop("GFLOW_WORKER_BINARY",None)
     environment.pop("PYTHONPATH",None)
     protected = {}
-    for pid in (44500,53760):
-        if psutil.pid_exists(pid):
-            process = psutil.Process(pid)
-            protected[pid] = process.create_time()
+    for existing in psutil.process_iter(["name", "create_time"]):
+        if (existing.info["name"] or "").lower() in ("cutflow.exe", "easycliproxyapi.exe", "cli-proxy-api.exe", "gflow-worker.exe"):
+            protected[existing.pid] = existing.info["create_time"]
     summary = {
         "hostExecutable":str(host), "hostSha256":checksum(host),
         "archive":archive.name,"archiveSha256":checksum(archive),
@@ -171,6 +170,34 @@ observability:
             control = json.loads(receipt["choices"][0]["message"]["content"])
             assert control["error"]["code"] == "unsupported_protocol"
             summary["checks"]["structured_control_error_survives_host"] = "passed"
+            # A free control request exercises the real native host-stream
+            # boundary. No Google account or generation endpoint is available.
+            control_request = {"version":1,"op":"capabilities","workspaceId":workspace}
+            body = {"model":"gflow-project-control","stream":True,
+                    "messages":[{"role":"user","content":json.dumps(control_request)}]}
+            request = urllib.request.Request(base + "/v1/chat/completions",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type":"application/json", "Authorization":"Bearer " + api_key}, method="POST")
+            began = time.monotonic()
+            with urllib.request.urlopen(request, timeout=30) as response:
+                assert response.status == 200
+                text = response.read().decode("utf-8")
+            summary["streamBodyBytes"] = len(text.encode("utf-8"))
+            assert text.count("data: [DONE]") == 1, "宿主应只输出一个流结束标记"
+            assert "data: data:" not in text, "SSE 被重复封装"
+            content = []
+            finished = False
+            for line in text.splitlines():
+                if line.startswith("data:") and line[5:].strip() != "[DONE]":
+                    chunk = json.loads(line[5:].strip())
+                    choices = chunk.get("choices", [{}])
+                    content.append(choices[0].get("delta", {}).get("content", ""))
+                    finished = finished or any(choice.get("finish_reason") for choice in choices)
+            control = json.loads("".join(content))
+            assert "error" not in control and finished, control
+            assert control["workspaceId"] == workspace and control["instanceId"] == first_instance
+            summary["streamControlSeconds"] = round(time.monotonic() - began, 3)
+            summary["checks"]["real_host_stream_control"] = "passed"
             with sqlite3.connect(stage/"gflow-data/flow.db") as db:
                 assert db.execute("SELECT COUNT(*) FROM tokens").fetchone()[0] == 0
                 assert db.execute("SELECT COUNT(*) FROM cutflow_projects").fetchone()[0] == 0
@@ -208,7 +235,7 @@ observability:
         summary["existingServicesUnchanged"] = all(psutil.pid_exists(pid) and psutil.Process(pid).create_time()==started for pid,started in protected.items())
         # 所有密钥均留在隔离临时目录；报告不含配置或密钥。
         summary["protectedProcessIds"] = list(protected)
-        summary["passed"] = len(summary["checks"])==6 and summary.get("hostStopped",False) and summary["existingServicesUnchanged"]
+        summary["passed"] = len(summary["checks"])==7 and summary.get("hostStopped",False) and summary["existingServicesUnchanged"]
         report_path.parent.mkdir(parents=True,exist_ok=True)
         report_path.write_text(json.dumps(summary,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
     assert summary["passed"], summary

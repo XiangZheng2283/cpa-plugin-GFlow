@@ -401,7 +401,23 @@ class GFlowService:
         context = None
         try:
             if params.get("model") == CONTROL_MODEL:
-                result = await self.handle_project_control(params)
+                # The versioned control protocol is a nonstream operation;
+                # SSE is only its transport wrapper at the host boundary.
+                control_params = dict(params)
+                control_params["stream"] = False
+                result = await self.handle_project_control(control_params)
+                if params.get("stream"):
+                    # Control probes use the same native stream boundary without
+                    # starting a Google media request.
+                    streamed = dict(result)
+                    streamed["object"] = "chat.completion.chunk"
+                    streamed["choices"] = [{"index": choice.get("index", 0),
+                        "delta": choice.get("message", {}),
+                        "finish_reason": choice.get("finish_reason", "stop")}
+                        for choice in result.get("choices", [])]
+                    self.send_line({"id": req_id, "stream": True,
+                        "chunk": "data: " + json.dumps(streamed, ensure_ascii=False) + "\n\n"})
+                    self.send_line({"id": req_id, "stream": True, "chunk": "data: [DONE]\n\n"})
                 self.send_line({"id": req_id, "done": True, "result": result})
                 return
             await self.initialize()
@@ -461,8 +477,6 @@ class GFlowService:
             )
 
             if is_stream:
-                from media_response import inline_cached_images, stream_cached_media
-                chunk_media = stream_cached_media if params.get("gflow_media_protocol") == "v1" else None
                 async for chunk in _iterate_openai_stream(normalized, base_url_override):
                     from generation_errors import generation_error
                     error = generation_error(chunk)
@@ -471,13 +485,13 @@ class GFlowService:
                         # An error inside a normal SSE chunk is counted as success by the host.
                         self.send_line({"id": req_id, "done": True, "error": error})
                         return
-                    output_chunks = chunk_media(chunk, self.tmp_dir) if chunk_media else [inline_cached_images(chunk, self.tmp_dir)]
-                    for output_chunk in output_chunks:
-                        self.send_line({
-                            "id": req_id,
-                            "stream": True,
-                            "chunk": output_chunk,
-                        })
+                    from media_response import inline_cached_images
+                    chunk = inline_cached_images(chunk, self.tmp_dir)
+                    self.send_line({
+                        "id": req_id,
+                        "stream": True,
+                        "chunk": chunk,
+                    })
                 self.send_line({
                     "id": req_id,
                     "stream": True,

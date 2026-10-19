@@ -30,6 +30,17 @@ for line in sys.stdin:
         continue
     if request.get("cmd") == "stall":
         continue
+    if request["params"].get("abi_stream_fixture"):
+        for index in range(48):
+            chunk = "data: " + json.dumps({"choices": [{"index": 0,
+                "delta": {"reasoning_content": "synthetic stage " + str(index)}, "finish_reason": None}]}) + "\n\n"
+            send({"id": request["id"], "stream": True, "chunk": chunk})
+        media = "![Generated Image](data:image/jpeg;base64," + "A" * (5 * 1024 * 1024) + ")"
+        chunk = "data: " + json.dumps({"choices": [{"index": 0,
+            "delta": {"content": media}, "finish_reason": "stop"}]}) + "\n\n"
+        send({"id": request["id"], "stream": True, "chunk": chunk})
+        send({"id": request["id"], "stream": True, "done": True})
+        continue
     if request["params"].get("progress_fixture"):
         progress = {"stage": "image_generated", "percent": 72, "basis": "stage"}
         chunk = "data: " + json.dumps({"gflow_progress": progress,

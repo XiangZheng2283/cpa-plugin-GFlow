@@ -56,23 +56,6 @@ class MediaResponseRegression(unittest.TestCase):
         with patch.object(module, "MAX_INLINE_BYTES", 1), self.assertRaisesRegex(ValueError, "authenticated"):
             module.inline_cached_images("/v0/management/plugins/gflow/api/tmp/" + filename, self.root)
 
-    def test_stream_large_media_uses_bounded_chunks_and_keeps_final_chunk_small(self):
-        filename = "b" * 32 + "_2K.jpg"
-        body = bytes(range(256)) * 4096
-        (self.root / filename).write_bytes(body)
-        with patch.object(module, "STREAM_INLINE_BYTES", 1024):
-            chunks = module.stream_cached_media(
-                'data: {"choices":[{"delta":{"content":"![Generated Image](/v0/resource/plugins/gflow/tmp/' + filename + ')"},"finish_reason":"stop"}]}\n\n',
-                self.root,
-            )
-        self.assertGreater(len(chunks), 2)
-        self.assertTrue(all(len(chunk.encode()) < 100_000 for chunk in chunks))
-        self.assertTrue(all('gflow_media' in chunk for chunk in chunks[:-1]))
-        self.assertEqual([module.json.loads(chunk[6:].strip())['gflow_media']['seq'] for chunk in chunks[:-1]], list(range(len(chunks) - 1)))
-        self.assertEqual(module.json.loads(chunks[0][6:].strip())['gflow_media']['size'], len(body))
-        self.assertNotIn(filename, chunks[-1])
-        self.assertNotIn('data:image', chunks[-1])
-
 
 if __name__ == "__main__":
     unittest.main()

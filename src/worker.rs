@@ -70,6 +70,13 @@ impl WorkerManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_fixture(data_dir: PathBuf, python: PathBuf, script: PathBuf) -> Self {
+        let worker = Self::new(data_dir);
+        worker.inner.lock().unwrap().fixture_command = Some((python, script));
+        worker
+    }
+
     #[allow(dead_code)]
     pub fn set_data_dir(&self, dir: PathBuf) {
         if let Ok(mut lock) = self.inner.lock() {

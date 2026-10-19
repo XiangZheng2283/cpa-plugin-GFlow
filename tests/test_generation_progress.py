@@ -44,6 +44,26 @@ def decode(chunk):
 
 
 class ProgressTest(unittest.IsolatedAsyncioTestCase):
+    async def test_control_probe_streams_standard_completion_without_media(self):
+        saved = sys.stdout
+        try:
+            from worker import GFlowService
+        finally:
+            sys.stdout = saved
+        worker = GFlowService.__new__(GFlowService)
+        worker.handle_project_control = AsyncMock(return_value={
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "capabilities"}, "finish_reason": "stop"}]})
+        worker._handle_chat_completion = AsyncMock()
+        events = []
+        worker.send_line = events.append
+        await worker.handle_chat_completion("probe", {"model": "gflow-project-control", "stream": True})
+        self.assertEqual(decode(events[0]["chunk"])["choices"][0]["delta"]["content"], "capabilities")
+        self.assertEqual(events[1]["chunk"], "data: [DONE]\n\n")
+        self.assertTrue(events[-1]["done"])
+        worker._handle_chat_completion.assert_not_called()
+        worker.handle_project_control.assert_awaited_once_with(
+            {"model": "gflow-project-control", "stream": False})
+
     async def test_callbacks_emit_stage_metadata_without_credentials_or_media_text(self):
         handler = Handler()
         events = []

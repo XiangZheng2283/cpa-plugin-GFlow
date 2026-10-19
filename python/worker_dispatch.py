@@ -17,6 +17,11 @@ class ManagementDispatcher:
 
     async def run(self, request_id, command, params):
         try:
+            if command == "project_control" and params.get("stream"):
+                # Control requests share the real chat stream path and its sole
+                # completion receipt; they remain independent of mutation locks.
+                await self.service.handle_chat_completion(request_id, params)
+                return
             handler = getattr(self.service, "handle_" + command, None)
             if handler is None:
                 raise ValueError("Unknown command: " + command)

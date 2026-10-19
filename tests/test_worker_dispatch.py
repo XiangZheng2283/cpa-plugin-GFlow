@@ -1,8 +1,10 @@
 import asyncio
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+from unittest.mock import AsyncMock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
@@ -43,6 +45,86 @@ class ManagementDispatcherTest(unittest.IsolatedAsyncioTestCase):
         release.set()
         await asyncio.gather(*list(dispatcher.tasks))
         self.assertEqual(results[-1]["id"], "sync")
+        await dispatcher.shutdown()
+
+    async def test_real_control_dispatch_streams_delta_done_and_one_receipt_while_mutation_waits(self):
+        # Exercise the command selected by worker.main, not just the handler.
+        saved_stdout = sys.stdout
+        try:
+            from worker import GFlowService
+        finally:
+            sys.stdout = saved_stdout
+        service = GFlowService.__new__(GFlowService)
+        result = {
+            "id": "control-fixture", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "capabilities"},
+                         "finish_reason": "stop"}],
+        }
+        service.handle_project_control = AsyncMock(return_value=result)
+        service._handle_chat_completion = AsyncMock()
+        events = []
+        service.send_line = events.append
+        dispatcher = ManagementDispatcher(service)
+        params = {"model": "gflow-project-control", "stream": True}
+        async with dispatcher.mutations:
+            dispatcher.submit("probe", "project_control", params)
+            await asyncio.wait_for(asyncio.gather(*list(dispatcher.tasks)), 1)
+        self.assertEqual(len(events), 3)
+        chunk = json.loads(events[0]["chunk"].removeprefix("data: ").strip())
+        self.assertEqual(chunk["object"], "chat.completion.chunk")
+        self.assertEqual(chunk["choices"][0]["delta"], {"role": "assistant", "content": "capabilities"})
+        self.assertEqual(events[1], {"id": "probe", "stream": True, "chunk": "data: [DONE]\n\n"})
+        self.assertEqual(events[2], {"id": "probe", "done": True, "result": result})
+        self.assertEqual(sum(event.get("done") is True for event in events), 1)
+        self.assertTrue(all(event["id"] == "probe" for event in events))
+        service.handle_project_control.assert_awaited_once_with({**params, "stream": False})
+        service._handle_chat_completion.assert_not_called()
+        await dispatcher.shutdown()
+
+    async def test_stream_control_runs_real_protocol_parser_without_mutating_input(self):
+        saved_stdout = sys.stdout
+        try:
+            from worker import GFlowService
+        finally:
+            sys.stdout = saved_stdout
+        from project_control import parse_control_request
+        service = GFlowService.__new__(GFlowService)
+        service.initialize = AsyncMock()
+        payload = {"version": 1, "op": "capabilities",
+                   "workspaceId": "00000000-0000-4000-8000-000000000001"}
+        service.project_control = SimpleNamespace(
+            instance_id="fixture-instance", handle=AsyncMock(return_value={"accepted": True}))
+        service._handle_chat_completion = AsyncMock()
+        events = []
+        service.send_line = events.append
+        dispatcher = ManagementDispatcher(service)
+        params = {"model": "gflow-project-control", "stream": True,
+                  "messages": [{"role": "user", "content": json.dumps(payload)}]}
+        dispatcher.submit("probe", "project_control", params)
+        await asyncio.wait_for(asyncio.gather(*list(dispatcher.tasks)), 1)
+        chunk = json.loads(events[0]["chunk"].removeprefix("data: ").strip())
+        self.assertEqual(json.loads(chunk["choices"][0]["delta"]["content"]), {"accepted": True})
+        service.project_control.handle.assert_awaited_once_with(
+            parse_control_request({**params, "stream": False}))
+        self.assertIs(params["stream"], True)
+        self.assertEqual(sum(event.get("done") is True for event in events), 1)
+        service._handle_chat_completion.assert_not_called()
+        await dispatcher.shutdown()
+
+    async def test_nonstream_control_dispatch_keeps_single_completion_receipt(self):
+        result = {"choices": [{"message": {"content": "capabilities"}}]}
+        service = SimpleNamespace(
+            handle_project_control=AsyncMock(return_value=result),
+            handle_chat_completion=AsyncMock(), send_line=lambda message: events.append(message),
+        )
+        events = []
+        dispatcher = ManagementDispatcher(service)
+        params = {"model": "gflow-project-control", "stream": False}
+        dispatcher.submit("probe", "project_control", params)
+        await asyncio.wait_for(asyncio.gather(*list(dispatcher.tasks)), 1)
+        self.assertEqual(events, [{"id": "probe", "done": True, "result": result}])
+        service.handle_project_control.assert_awaited_once_with(params)
+        service.handle_chat_completion.assert_not_called()
         await dispatcher.shutdown()
 
     async def test_mutating_requests_stay_serialized(self):
