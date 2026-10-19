@@ -1,6 +1,6 @@
 name: Fork sync and compat release
 
-# 仅存在于 fork：同步上游 main，并把上游已打 tag 的版本在 Ubuntu 22.04 (GLIBC 2.35) 上重新构建发布。
+# 仅存在于 fork：同步上游 main，把「上游已打 tag 的版本 + fork 自有改动」在 Ubuntu 22.04 (GLIBC 2.35) 上重新构建发布。
 # 上游 build.yml 保持原样，避免同步冲突。
 
 on:
@@ -11,7 +11,7 @@ on:
         type: boolean
         default: true
       force:
-        description: 该版本已发布时仍删除并重新构建发布
+        description: 内容未变化时也发布新的修订版本
         type: boolean
         default: false
   schedule:
@@ -36,8 +36,10 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.plan.outputs.sha }}
+      upstream_sha: ${{ steps.plan.outputs.upstream_sha }}
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
+      key: ${{ steps.plan.outputs.key }}
       publish: ${{ steps.plan.outputs.publish }}
     steps:
       - name: Sync fork main with upstream
@@ -58,42 +60,65 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Resolve upstream release
+      - name: Plan release
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force || false }}
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           version=$(python3 -c 'import tomllib;print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
           upstream_tag="v$version"
-          tag="$upstream_tag$TAG_SUFFIX"
           refs=$(git ls-remote "https://github.com/$UPSTREAM_REPOSITORY.git" "refs/tags/$upstream_tag" "refs/tags/$upstream_tag^{}")
-          sha=$(echo "$refs" | awk '/\^\{\}$/{print $1}')
-          [ -n "$sha" ] || sha=$(echo "$refs" | awk 'NF{print $1; exit}')
-          if [ -z "$sha" ]; then
-            if [ "$FORCE" != "true" ]; then
-              echo "::notice::上游尚未发布 $upstream_tag，跳过。"
-              echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
-            fi
-            sha=$(git rev-parse HEAD)
-            echo "::warning::上游没有 $upstream_tag，force 模式下使用 main $sha 构建。"
+          upstream_sha=$(echo "$refs" | awk '/\^\{\}$/{print $1}')
+          [ -n "$upstream_sha" ] || upstream_sha=$(echo "$refs" | awk 'NF{print $1; exit}')
+          if [ -z "$upstream_sha" ]; then
+            echo "::notice::上游尚未发布 $upstream_tag，跳过。"
+            echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          if ! git merge-base --is-ancestor "$sha" HEAD; then
-            echo "::error::上游 $upstream_tag ($sha) 不在 fork main 历史中，请先同步。"; exit 1
+          git merge-base --is-ancestor "$upstream_sha" HEAD || { echo "::error::上游 $upstream_tag 不在 fork main 历史中，请先同步。"; exit 1; }
+
+          # fork 自有改动 = 最近一次合入的上游提交到 main 的差异（不含 workflow 文件）。
+          git fetch -q --no-tags "https://github.com/$UPSTREAM_REPOSITORY.git" main
+          base=$(git merge-base FETCH_HEAD HEAD)
+          git diff --binary "$base" HEAD -- . ':(exclude).github/workflows' > "$RUNNER_TEMP/fork.patch"
+          git log --no-merges --format='- %s (%h)' "$base..HEAD" -- . ':(exclude).github/workflows' > "$RUNNER_TEMP/fork-changes.md"
+          key="$upstream_sha:$(sha256sum "$RUNNER_TEMP/fork.patch" | cut -c1-16)"
+
+          prefix="v$version$TAG_SUFFIX"
+          latest=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isDraft,createdAt \
+            -q "[.[] | select(.isDraft | not) | select(.tagName == \"$prefix\" or (.tagName | startswith(\"$prefix-r\")))] | sort_by(.createdAt) | last | .tagName // empty")
+          if [ -n "$latest" ] && gh release view "$latest" --repo "$GITHUB_REPOSITORY" --json body -q .body | grep -qF "fork-key: $key" && [ "$FORCE" != "true" ]; then
+            echo "::notice::$latest 已包含当前内容（$key），无需构建。"
+            echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          publish=true
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null | grep -qx false; then
-            if [ "$FORCE" = "true" ]; then
-              echo "::notice::$tag 已发布，force 模式将重新发布。"
-            else
-              echo "::notice::$tag 已发布，无需构建。"
-              publish=false
-            fi
+          existing=$(git ls-remote --tags origin | sed 's#.*refs/tags/##; s#\^{}$##' | sort -u)
+          tag=$prefix; n=1
+          while echo "$existing" | grep -qx -- "$tag"; do n=$((n + 1)); tag="$prefix-r$n"; done
+
+          git checkout -q --detach "$upstream_sha"
+          if [ -s "$RUNNER_TEMP/fork.patch" ]; then
+            git apply --index --3way "$RUNNER_TEMP/fork.patch" || { echo "::error::fork 改动无法应用到上游 $upstream_tag，请手动处理冲突。"; exit 1; }
+            git commit -q -m "fork: $tag build of $upstream_tag" -m "$(cat "$RUNNER_TEMP/fork-changes.md")"
           fi
+          sha=$(git rev-parse HEAD)
+          git push -q -f origin "HEAD:refs/heads/fork-build/$tag"
           {
-            echo "version=$version"; echo "tag=$tag"; echo "sha=$sha"; echo "publish=$publish"
+            echo "version=$version"; echo "tag=$tag"; echo "sha=$sha"; echo "upstream_sha=$upstream_sha"
+            echo "key=$key"; echo "publish=true"
           } >> "$GITHUB_OUTPUT"
-          echo "### $tag ← $UPSTREAM_REPOSITORY@$upstream_tag (\`$sha\`) publish=$publish" >> "$GITHUB_STEP_SUMMARY"
+          cp "$RUNNER_TEMP/fork-changes.md" fork-changes.md
+          echo "### $tag ← $UPSTREAM_REPOSITORY@$upstream_tag + fork 改动 (\`$sha\`)" >> "$GITHUB_STEP_SUMMARY"
+          cat fork-changes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.publish == 'true'
+        with:
+          name: fork-changes
+          path: fork-changes.md
+          if-no-files-found: ignore
+          retention-days: 7
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
@@ -167,15 +192,21 @@ jobs:
           path: dist-download
           pattern: dist-*
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: fork-changes
+          path: fork-meta
+        continue-on-error: true
       - name: Verify artifacts and write release notes
         env:
           VERSION: ${{ needs.sync.outputs.version }}
-          SHA: ${{ needs.sync.outputs.sha }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+          KEY: ${{ needs.sync.outputs.key }}
         run: |
           python3 - <<'EOF'
           import hashlib, json, os, re, zipfile
           from pathlib import Path
-          version, sha = os.environ["VERSION"], os.environ["SHA"]
+          version, upstream_sha = os.environ["VERSION"], os.environ["UPSTREAM_SHA"]
           dist = Path("dist-download")
           platforms = [("darwin", "amd64", "dylib"), ("darwin", "arm64", "dylib"),
                        ("linux", "amd64", "so"), ("linux", "arm64", "so"), ("windows", "amd64", "dll")]
@@ -194,12 +225,19 @@ jobs:
           notes = Path("RELEASE_NOTES.md").read_text(encoding="utf-8")
           match = re.search(rf"^# GFlow v{re.escape(version)}\s*$(.*?)(?=^# GFlow v|\Z)", notes, re.M | re.S)
           upstream = match.group(1).strip() if match else ""
+          changes_file = Path("fork-meta/fork-changes.md")
+          changes = changes_file.read_text(encoding="utf-8").strip() if changes_file.exists() else ""
           repo = os.environ["UPSTREAM_REPOSITORY"]
-          header = (f"基于上游 [{repo} v{version}](https://github.com/{repo}/releases/tag/v{version})（`{sha[:12]}`）重新构建。\n\n"
-                    f"- Linux 产物在 Ubuntu 22.04 构建，只需 GLIBC ≤ {os.environ['MAX_GLIBC']}（上游官方包需要 2.39，Ubuntu 22.04 / Debian 12 上 worker 无法启动）。\n"
-                    "- macOS / Windows 产物与上游构建方式相同。\n"
-                    "- 安装：解压对应平台 zip，用其中的 `gflow.so` 替换 CPA `plugins/<os>/<arch>/` 下的 `gflow-v*.so` 后重启 CPA。\n")
-          Path("release-notes.md").write_text(header + ("\n## 上游更新\n\n" + upstream + "\n" if upstream else ""), encoding="utf-8")
+          body = (f"基于上游 [{repo} v{version}](https://github.com/{repo}/releases/tag/v{version})（`{upstream_sha[:12]}`）重新构建。\n\n"
+                  f"- Linux 产物在 Ubuntu 22.04 构建，只需 GLIBC ≤ {os.environ['MAX_GLIBC']}（上游官方包需要 2.39，Ubuntu 22.04 / Debian 12 上 worker 无法启动）。\n"
+                  "- macOS / Windows 产物与上游构建方式相同。\n"
+                  "- 安装：解压对应平台 zip，用其中的 `gflow.so` 替换 CPA `plugins/<os>/<arch>/` 下的 `gflow-v*.so` 后重启 CPA。\n")
+          if changes:
+              body += "\n## Fork 改动\n\n" + changes + "\n"
+          if upstream:
+              body += "\n## 上游更新\n\n" + upstream + "\n"
+          body += f"\n<!-- fork-key: {os.environ['KEY']} -->\n"
+          Path("release-notes.md").write_text(body, encoding="utf-8")
           EOF
       - name: Publish release
         env:
@@ -207,12 +245,8 @@ jobs:
           TAG: ${{ needs.sync.outputs.tag }}
           SHA: ${{ needs.sync.outputs.sha }}
         run: |
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
-          elif gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
-            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG"
-          fi
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" --latest \
             --title "GFlow $TAG" --notes-file release-notes.md \
             dist-download/*.zip dist-download/checksums.txt
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/fork-build/$TAG" || true
           echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
