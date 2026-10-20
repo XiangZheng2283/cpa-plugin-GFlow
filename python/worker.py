@@ -128,7 +128,10 @@ class GFlowService:
         config.set_flow_max_retries(1)
 
         self.proxy_manager = ProxyManager(self.db)
-        self.flow_client = FlowClient(self.proxy_manager, self.db)
+        from browser_diagnostics import BrowserDiagnosticFlowMixin
+        class PluginFlowClient(BrowserDiagnosticFlowMixin, FlowClient):
+            pass
+        self.flow_client = PluginFlowClient(self.proxy_manager, self.db)
         # 保留 flow2api 自身的分步骤超时；整项任务由 GenerationManager 截止和取消。
         from project_control import ProjectControl, PoolDatabase, BoundTokenManager, BoundLoadBalancer
         self.project_control = ProjectControl(self)
@@ -427,7 +430,8 @@ class GFlowService:
             context = CURRENT_BINDING.set(binding)
             from generation_progress import progress_scope
             emit = (lambda chunk: self.send_line({"id": req_id, "stream": True, "chunk": chunk})) if params.get("stream") else None
-            with progress_scope(emit):
+            from browser_diagnostics import browser_diagnostic_scope
+            with progress_scope(emit), browser_diagnostic_scope():
                 await self._handle_chat_completion(req_id, params)
         except ProjectControlError as error:
             self.send_line({"id": req_id, "done": True, "error": error.payload()})
@@ -481,6 +485,8 @@ class GFlowService:
                     from generation_errors import generation_error
                     error = generation_error(chunk)
                     if error:
+                        from browser_diagnostics import diagnose_browser_error
+                        error = diagnose_browser_error(error)
                         # Send failure through the native executor error channel.
                         # An error inside a normal SSE chunk is counted as success by the host.
                         self.send_line({"id": req_id, "done": True, "error": error})
@@ -509,6 +515,8 @@ class GFlowService:
                 from generation_errors import generation_error
                 error = generation_error(payload)
                 if error:
+                    from browser_diagnostics import diagnose_browser_error
+                    error = diagnose_browser_error(error)
                     self.send_line({"id": req_id, "done": True, "error": error})
                     return
                 from media_response import inline_cached_images

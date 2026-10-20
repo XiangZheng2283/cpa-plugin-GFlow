@@ -75,6 +75,36 @@ class ControlProtocolTest(unittest.TestCase):
         self.assertEqual(pro_models[0]["imageSizes"], ["1K", "2K"])
         self.assertEqual(model_capabilities()[0]["imageSizes"], ["1K"])
 
+    def test_reference_limits_follow_each_resolved_video_route_and_duration(self):
+        from model_adapter import resolve_model_name
+        from src.services.generation_handler import MODEL_CONFIG
+        models = {model["id"]: model for model in model_capabilities()}
+        expected = {
+            "gflow-omni-1.1-flash": {"4": 3, "6": 3, "8": 3, "10": 3},
+            "gflow-veo-3.1-lite": {"4": 2, "6": 2, "8": 3},
+            "gflow-veo-3.1-fast": {"4": 2, "6": 2, "8": 3},
+            "gflow-veo-3.1-quality": {"4": 2, "6": 2, "8": 0},
+        }
+        for model_id, limits in expected.items():
+            metadata = models[model_id]
+            self.assertEqual(metadata["maxReferencesByDuration"], limits)
+            # Older clients without the duration map must receive a safe limit.
+            self.assertEqual(metadata["maxReferences"], min(limits.values()))
+            for seconds, limit in limits.items():
+                for aspect in ("16:9", "9:16"):
+                    with self.subTest(model=model_id, seconds=seconds, aspect=aspect):
+                        resolved = resolve_model_name(model_id,
+                            request={"duration": int(seconds), "aspect_ratio": aspect},
+                            model_config=MODEL_CONFIG, images=[b"synthetic"])
+                        config = MODEL_CONFIG[resolved]
+                        actual = config.get("max_images", 0) if config.get("supports_images") else 0
+                        self.assertEqual(limit, actual)
+                        self.assertEqual(metadata["durations"], [int(value) for value in limits])
+        for model in models.values():
+            if model["kind"] == "image":
+                self.assertNotIn("maxReferencesByDuration", model)
+                self.assertEqual(model["maxReferences"], 3)
+
 
 class ProjectPersistenceTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

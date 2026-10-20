@@ -12,6 +12,8 @@ MEDIA_TYPES = {
     ".webp": "image/webp", ".mp4": "video/mp4", ".webm": "video/webm",
     ".mov": "video/quicktime",
 }
+# Must match CutFlow MAX_INLINE_MEDIA_BYTES. The client separately budgets
+# base64 expansion and SSE/JSON overhead instead of limiting the wire to 32 MiB.
 MAX_INLINE_BYTES = 128 * 1024 * 1024
 
 
@@ -25,9 +27,15 @@ def inline_cached_images(value, cache_dir):
             path = root / filename
             if path.is_symlink() or path.resolve().parent != root or not path.is_file():
                 raise ValueError("Generated media is missing from the GFlow cache; generation was not retried")
+            error = "Generated media exceeds the 128 MiB inline limit; the existing cached file is retained and generation was not retried"
             if path.stat().st_size > MAX_INLINE_BYTES:
-                raise ValueError("Generated media exceeds the 128 MiB inline limit; retrieve the cached file through the authenticated GFlow media management API")
-            memo[filename] = "data:" + MEDIA_TYPES[path.suffix] + ";base64," + base64.b64encode(path.read_bytes()).decode("ascii")
+                raise ValueError(error)
+            # Bound the read as well: a cache file may still grow after stat().
+            with path.open("rb") as media:
+                content = media.read(MAX_INLINE_BYTES + 1)
+            if len(content) > MAX_INLINE_BYTES:
+                raise ValueError(error)
+            memo[filename] = "data:" + MEDIA_TYPES[path.suffix] + ";base64," + base64.b64encode(content).decode("ascii")
         return memo[filename]
 
     def walk(item):

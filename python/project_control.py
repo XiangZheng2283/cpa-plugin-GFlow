@@ -111,13 +111,27 @@ def model_capabilities(tokens=None):
     from src.core.account_tiers import get_paygate_tier_rank
     rank = max((get_paygate_tier_rank(getattr(t, "user_paygate_tier", None)) for t in (tokens or [])), default=0)
     sizes = ["1K", "2K", "4K"][:rank + 1]
-    return [
-        {"id": model, "kind": kind, "maxReferences": 3,
-         "aspects": ["1:1", "16:9", "9:16", "4:3", "3:4"] if kind == "image" else ["16:9", "9:16"],
-         "imageSizes": sizes if kind == "image" else [],
-         "durations": ([4, 6, 8, 10] if "omni" in model else [4, 6, 8]) if kind == "video" else []}
-        for model, kind in BASE_MODELS
-    ]
+    result = []
+    for model, kind in BASE_MODELS:
+        metadata = {
+            "id": model, "kind": kind, "maxReferences": 3,
+            "aspects": ["1:1", "16:9", "9:16", "4:3", "3:4"] if kind == "image" else ["16:9", "9:16"],
+            "imageSizes": sizes if kind == "image" else [],
+            "durations": [],
+        }
+        if kind == "video":
+            durations = [4, 6, 8, 10] if "omni" in model else [4, 6, 8]
+            # Match model_adapter's reference branch and the current MODEL_CONFIG:
+            # Veo 4/6s uses I2V (2); Lite/Fast 8s uses R2V (3).
+            # Quality 8s is currently T2V and discards references, so forbid them.
+            if "omni" in model:
+                limits = {str(seconds): 3 for seconds in durations}
+            else:
+                limits = {"4": 2, "6": 2, "8": 0 if "quality" in model else 3}
+            metadata.update(durations=durations, maxReferencesByDuration=limits,
+                            maxReferences=min(limits.values()))
+        result.append(metadata)
+    return result
 
 
 class PoolDatabase:
